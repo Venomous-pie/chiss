@@ -237,6 +237,16 @@
             box-shadow: inset 0 0 8px rgba(255, 87, 34, 0.4);
         }
         
+        /* Bishop heal availability glow */
+        .cell.bishop-glow-white {
+            border: 2px solid #2196f3 !important;
+            box-shadow: 0 0 16px rgba(33, 150, 243, 0.9), inset 0 0 10px rgba(33, 150, 243, 0.35);
+        }
+        .cell.bishop-glow-black {
+            border: 2px solid #f44336 !important;
+            box-shadow: 0 0 16px rgba(244, 67, 54, 0.9), inset 0 0 10px rgba(244, 67, 54, 0.35);
+        }
+        
         /* Possible moves preview dots */
         .cell.preview-move::before {
             content: '';
@@ -615,7 +625,14 @@
                 this.lastMove = null; // Track last move for highlighting
                 this.animationInProgress = false; // Prevent clicks during animations
                 
+                // Bishop healing state
+                this.healAvailable = { white: true, black: true }; // one shared heal per side
+                this.bishopAttackUnlocked = { white: false, black: false }; // bishops can capture only after first heal
+                this.healTargets = null; // cached heal squares for selected bishop
+                this.officialTypes = new Set(['queen','rook','bishop','knight']);
+
                 this.initializePieces();
+                this.markInitialPositions();
                 this.createBoard();
                 this.setupEventListeners();
                 this.updateDisplay();
@@ -660,6 +677,17 @@
                 this.board[3][7] = { type: 'pawn', color: 'white', symbol: '♙' };
                 this.board[7][3] = { type: 'pawn', color: 'white', symbol: '♙' };
             }
+
+            markInitialPositions() {
+                for (let r = 0; r < 8; r++) {
+                    for (let c = 0; c < 8; c++) {
+                        const p = this.board[r][c];
+                        if (p && !p.initial) {
+                            p.initial = [r, c];
+                        }
+                    }
+                }
+            }
             
             createBoard() {
                 const boardElement = document.getElementById('board');
@@ -678,6 +706,10 @@
                         
                         const piece = this.board[row][col];
                         if (piece) {
+                            // Bishop glow when heal is available for this side, only on current bishop tiles
+                            if (piece.type === 'bishop' && this.healAvailable && this.healAvailable[piece.color]) {
+                                cell.classList.add(piece.color === 'white' ? 'bishop-glow-white' : 'bishop-glow-black');
+                            }
                             const pieceSpan = document.createElement('span');
                             pieceSpan.textContent = piece.symbol;
                             pieceSpan.style.transform = 'rotate(-45deg)';
@@ -748,13 +780,17 @@
                 
                 // Highlight valid moves
                 this.highlightValidMoves(row, col);
+                
+                // Automatic bishop healing (no prompt)
+                this.tryAutomaticBishopHeal(row, col);
             }
             
             clearSelection() {
                 document.querySelectorAll('.cell').forEach(cell => {
-                    cell.classList.remove('selected', 'valid-move', 'capture-move');
+                    cell.classList.remove('selected', 'valid-move', 'capture-move', 'preview-move', 'preview-capture');
                 });
                 this.selectedCell = null;
+                this.healTargets = null;
             }
             
             clearAllHighlights() {
@@ -817,7 +853,14 @@
                     case 'rook':
                         return (rowDiff === 0 || colDiff === 0) && this.isPathClear(fromRow, fromCol, toRow, toCol);
                     case 'bishop':
-                        return rowDiff === colDiff && this.isPathClear(fromRow, fromCol, toRow, toCol);
+                        if (rowDiff !== colDiff) return false;
+                        if (!this.isPathClear(fromRow, fromCol, toRow, toCol)) return false;
+                        // If heal is available (glowing), bishops cannot capture
+                        const target = this.board[toRow][toCol];
+                        if (target && target.color !== piece.color && this.healAvailable && this.healAvailable[piece.color]) {
+                            return false;
+                        }
+                        return true;
                     case 'queen':
                         return (rowDiff === 0 || colDiff === 0 || rowDiff === colDiff) && this.isPathClear(fromRow, fromCol, toRow, toCol);
                     case 'knight':
@@ -993,6 +1036,92 @@
                 
                 return true;
             }
+
+            getBishopHealTargets(row, col) {
+                const piece = this.board[row][col];
+                if (!piece || piece.type !== 'bishop') return [];
+                if (!this.healAvailable[piece.color]) return [];
+                const dirs = [[1,1],[1,-1],[-1,1],[-1,-1]];
+                const capturedSet = new Set(
+                    this.capturedPieces[piece.color]
+                        .filter(p => p && p.initial)
+                        .map(p => `${p.initial[0]},${p.initial[1]}`)
+                );
+                const targets = [];
+                for (const [dr, dc] of dirs) {
+                    let r = row + dr, c = col + dc;
+                    while (r >= 0 && r < 8 && c >= 0 && c < 8) {
+                        if (this.board[r][c]) break; // blocked
+                        if (capturedSet.has(`${r},${c}`)) {
+                            targets.push([r, c]);
+                        }
+                        r += dr; c += dc;
+                    }
+                }
+                return targets;
+            }
+
+            tryAutomaticBishopHeal(row, col) {
+                const piece = this.board[row][col];
+                if (!piece || piece.type !== 'bishop') return;
+                const color = piece.color;
+                if (!this.healAvailable[color]) return;
+                const targets = this.getBishopHealTargets(row, col);
+                if (!targets || targets.length === 0) return;
+                // Choose nearest target by diagonal distance
+                let best = null;
+                let bestDist = Infinity;
+                for (const [r, c] of targets) {
+                    const dist = Math.abs(r - row); // equal to |c - col| on diagonal
+                    if (dist < bestDist) {
+                        bestDist = dist;
+                        best = [r, c];
+                    }
+                }
+                if (best) {
+                    this.performBishopHeal(row, col, best[0], best[1]);
+                }
+            }
+
+            performBishopHeal(fromRow, fromCol, targetRow, targetCol) {
+                const bishop = this.board[fromRow][fromCol];
+                if (!bishop || bishop.type !== 'bishop') return false;
+                const color = bishop.color;
+                if (!this.healAvailable[color]) return false;
+                const idx = this.capturedPieces[color].findIndex(p => p.initial && p.initial[0] === targetRow && p.initial[1] === targetCol);
+                if (idx === -1) return false;
+                const revived = this.capturedPieces[color][idx];
+                if (this.board[targetRow][targetCol]) return false; // must be empty
+
+                // Remove from captured list and place on board
+                this.capturedPieces[color].splice(idx, 1);
+                this.board[targetRow][targetCol] = { ...revived };
+
+                // Record special action for undo
+                this.gameHistory.push({
+                    special: 'heal',
+                    by: [fromRow, fromCol],
+                    revived: { ...revived },
+                    at: [targetRow, targetCol],
+                    color,
+                    prevHealAvailable: this.healAvailable[color],
+                    prevBishopAttackUnlocked: this.bishopAttackUnlocked[color]
+                });
+
+                // Consume heal and unlock bishop attacks for this side
+                this.healAvailable[color] = false;
+                this.bishopAttackUnlocked[color] = true;
+
+                // Update UI/state and end turn
+                this.clearAllHighlights();
+                this.createBoard();
+                this.clearSelection();
+                this.showAttackIndicators();
+                this.switchPlayerWithAnimation();
+                this.updateDisplay();
+                this.checkGameEnd();
+                return true;
+            }
             
             makeMove(fromRow, fromCol, toRow, toCol) {
                 const piece = this.board[fromRow][fromCol];
@@ -1003,12 +1132,17 @@
                     from: [fromRow, fromCol],
                     to: [toRow, toCol],
                     piece: { ...piece },
-                    captured: capturedPiece ? { ...capturedPiece } : null
+                    captured: capturedPiece ? { ...capturedPiece } : null,
+                    prevHealAvailable: { ...this.healAvailable }
                 });
                 
                 // Handle capture
                 if (capturedPiece) {
                     this.capturedPieces[capturedPiece.color].push(capturedPiece);
+                    // Restore heal if capturing an official piece
+                    if (this.officialTypes.has(capturedPiece.type)) {
+                        this.healAvailable[piece.color] = true;
+                    }
                 }
                 
                 // Track last move for highlighting
@@ -1270,20 +1404,41 @@
                 this.gameStatus = 'playing';
                 this.lastMove = null;
                 this.animationInProgress = false;
+                this.healAvailable = { white: true, black: true };
+                this.bishopAttackUnlocked = { white: false, black: false };
+                this.healTargets = null;
                 
                 this.initializePieces();
+                this.markInitialPositions();
                 this.createBoard();
                 this.updateDisplay();
                 this.clearCheckHighlight();
                 this.clearAllHighlights();
                 this.showAttackIndicators();
             }
-            
             undoMove() {
                 if (this.gameHistory.length === 0) return;
                 
                 const lastMove = this.gameHistory.pop();
-                const { from, to, piece, captured } = lastMove;
+                if (lastMove.special === 'heal') {
+                    const { at, revived, color, prevHealAvailable, prevBishopAttackUnlocked } = lastMove;
+                    // Remove revived piece from board and return to captured list
+                    this.board[at[0]][at[1]] = null;
+                    this.capturedPieces[color].push(revived);
+                    this.healAvailable[color] = prevHealAvailable;
+                    this.bishopAttackUnlocked[color] = prevBishopAttackUnlocked;
+                    
+                    this.switchPlayer();
+                    this.createBoard();
+                    this.updateDisplay();
+                    this.clearSelection();
+                    this.clearAllHighlights();
+                    this.highlightLastMove();
+                    this.showAttackIndicators();
+                    return;
+                }
+
+                const { from, to, piece, captured, prevHealAvailable } = lastMove;
                 
                 // Restore piece to original position
                 this.board[from[0]][from[1]] = piece;
@@ -1296,6 +1451,11 @@
                     if (index !== -1) {
                         capturedArray.splice(index, 1);
                     }
+                }
+
+                // Restore heal availability prior to the undone move
+                if (prevHealAvailable) {
+                    this.healAvailable = { ...prevHealAvailable };
                 }
                 
                 // Update last move tracking
